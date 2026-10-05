@@ -19,7 +19,7 @@ jobs:
       - name: Install video dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg fonts-noto-cjk
+          sudo apt-get install -y -qq ffmpeg fonts-noto-cjk fonts-mplus
           pip install --quiet pillow
 
       - name: Run ANIME TREND WATCH
@@ -47,4 +47,3 @@ jobs:
           git diff --cached --quiet || git commit -m "daily: $(date -u -d '+9 hours' +%Y-%m-%d)"
           git pull --rebase -X theirs origin main
           git push
-
