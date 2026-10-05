@@ -1,21 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ANIME TREND WATCH - 週次ランキング動画生成
-outputs/<日付>/top5.json を読み、ランキング動画を2サイズ生成する:
-  reel.mp4  1080x1920 (9:16)  リール / ストーリーズ / TikTok / YouTubeショート用
-  feed.mp4  1080x1350 (4:5)   Instagramフィード投稿用(切り取られない最大縦比)
+TREND WATCH - POPランキング動画生成(季節テーマ対応)
+outputs/<日付>/ranking_all.json を読み、明るくポップなランキング動画を生成する。
 
-方式: PILでスライド画像を描画 → ffmpegでフェードつなぎのMP4に変換
-使用素材: 自前で生成したテキスト・図形のみ(CM映像・サムネイルは一切使わない)
-音声: 無音(BGMは投稿先アプリ内のライセンス楽曲を付けるのが安全)
+出力(outputs/<日付>/):
+  reel.mp4    1080x1920 (9:16)  Instagramリール / ストーリーズ / YouTubeショート用
+  tiktok.mp4  1080x1920 (9:16)  TikTok用(reelと同内容。TikTokのUI被りを考慮した
+                                 セーフゾーン設計は全フォーマット共通)
+  feed.mp4    1080x1350 (4:5)   Instagramフィード投稿用
 
-必要環境: ffmpeg, fonts-noto-cjk, pillow
+デザイン:
+  実行日の季節を自動判定し、背景色・飾り(花びら/泡/落ち葉/雪)・
+  季節バッジが切り替わるPOPテイスト。SEASONS を編集すれば配色変更可、
+  SEASON_OVERRIDE で季節固定も可。
+
+使用素材: 自前で生成したテキスト・図形のみ(権利物は一切使わない)
+必要環境: ffmpeg, fonts-noto-cjk, fonts-mplus, pillow
 使い方:   python make_video.py            # 今日のフォルダを対象
-          python make_video.py 2026-07-13 # 日付指定
+          python make_video.py 2026-10-05 # 日付指定
 """
 
 import json
+import math
+import random
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -24,39 +33,66 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-# 出力フォーマット: ファイル名 → (幅, 高さ)
-SIZES = {"reel": (1080, 1920), "feed": (1080, 1350)}
+# ===== メディア設定(アイドル版/アニメ版でここだけ異なる)=====
+BRAND = "ANIME TREND WATCH"
+TAGLINE = "いま伸びているアニメ公式映像を毎週届ける速報"
 CATEGORIES = [("all", "アニメ")]
 
-SLIDE_SEC = 4.6      # 1スライドの表示秒数
-FADE = 0.4           # フェード秒数
+# ===== 出力フォーマット =====
+SIZES = {"reel": (1080, 1920), "feed": (1080, 1350)}
+TIKTOK_FROM = "reel"  # tiktok.mp4 はこのフォーマットの複製として書き出す
+
+SLIDE_SEC = 4.6
+FADE = 0.4
 FPS = 30
 
 BASE_DIR = Path(__file__).resolve().parent
 OUT_ROOT = BASE_DIR / "outputs"
 JST = timezone(timedelta(hours=9))
 
-BRAND = "ANIME TREND WATCH"
-TAGLINE = "いま伸びているアニメ公式映像を毎週届ける速報"
-
 # ============================================================
-# 配色設定
+# 季節テーマ(自由に編集OK)
 # ============================================================
-# 季節ごとの背景グラデーション(上の色, 下の色)。自由に編集OK。
-SEASON_PALETTES = {
-    "spring": ((40, 22, 44), (78, 38, 66)),    # 3-5月: 夜桜プラム
-    "summer": ((10, 26, 50), (16, 60, 84)),    # 6-8月: 夏の深海ブルー
-    "autumn": ((38, 22, 14), (78, 42, 22)),    # 9-11月: 焦がしアンバー
-    "winter": ((12, 16, 34), (30, 42, 74)),    # 12-2月: 冬のアイスネイビー
+SEASONS = {
+    "spring": {
+        "ja": "春", "en": "SPRING",
+        "bg_top": (255, 245, 249), "bg_bottom": (255, 214, 231),
+        "ink": (93, 44, 72),            # 文字のメイン色(濃いプラム)
+        "muted": (164, 120, 142),       # 補助テキスト
+        "accents": [(255, 111, 165), (126, 203, 111), (255, 200, 61), (143, 184, 255)],
+        "deco": "petal",
+    },
+    "summer": {
+        "ja": "夏", "en": "SUMMER",
+        "bg_top": (234, 251, 255), "bg_bottom": (195, 236, 255),
+        "ink": (21, 69, 107),           # 濃いマリンネイビー
+        "muted": (104, 145, 173),
+        "accents": [(0, 166, 214), (255, 200, 61), (255, 123, 107), (52, 201, 163)],
+        "deco": "bubble",
+    },
+    "autumn": {
+        "ja": "秋", "en": "AUTUMN",
+        "bg_top": (255, 247, 233), "bg_bottom": (255, 224, 185),
+        "ink": (92, 51, 23),            # 濃いチョコブラウン
+        "muted": (166, 124, 92),
+        "accents": [(242, 140, 40), (201, 79, 46), (227, 181, 5), (140, 98, 57)],
+        "deco": "leaf",
+    },
+    "winter": {
+        "ja": "冬", "en": "WINTER",
+        "bg_top": (244, 250, 255), "bg_bottom": (217, 234, 250),
+        "ink": (31, 58, 95),            # 冬のネイビー
+        "muted": (116, 142, 173),
+        "accents": [(74, 144, 217), (93, 194, 192), (179, 157, 219), (255, 182, 100)],
+        "deco": "snow",
+    },
 }
-# 季節を固定したい場合はここに "spring" / "summer" / "autumn" / "winter" を指定。
-# None なら実行日の月から自動判定。
-SEASON_OVERRIDE = None
+SEASON_OVERRIDE = None  # "spring"/"summer"/"autumn"/"winter" で固定。Noneなら月から自動
 
-WHITE = (245, 245, 250)
-GRAY = (168, 172, 190)
-RANK_COLORS = [(255, 200, 60), (200, 205, 220), (205, 135, 80)]  # 金・銀・銅
-OTHER_COLOR = (110, 160, 255)  # 4位以下のアクセント
+WHITE = (255, 255, 255)
+RANK_GOLD = (255, 179, 0)
+RANK_SILVER = (139, 162, 189)
+RANK_BRONZE = (199, 123, 74)
 
 
 def season_of(month: int) -> str:
@@ -69,36 +105,41 @@ def season_of(month: int) -> str:
     return "winter"
 
 
-def rank_color(i: int):
-    return RANK_COLORS[i] if i < 3 else OTHER_COLOR
-
-
 def rank_label(i: int) -> str:
     return f"第{i + 1}位" if i < 3 else f"{i + 1}位"
 
-FONT_CANDIDATES = [
+
+# ============================================================
+# フォント(丸みのあるM PLUS 2を優先、無ければNoto)
+# ============================================================
+FONT_HEAVY_CANDIDATES = [
+    "/usr/share/fonts/opentype/mplus/Mplus2-Black.otf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Black.ttc",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
+]
+FONT_BOLD_CANDIDATES = [
+    "/usr/share/fonts/opentype/mplus/Mplus2-Bold.otf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
 ]
 
 
-def find_font() -> str:
-    for p in FONT_CANDIDATES:
+def pick_font(cands: list[str]) -> str:
+    for p in cands:
         if Path(p).exists():
             return p
-    try:
-        out = subprocess.run(["fc-list", ":lang=ja", "file"], capture_output=True, text=True).stdout
-        for line in out.splitlines():
-            f = line.split(":")[0].strip()
-            if f.endswith((".ttc", ".ttf", ".otf")):
-                return f
-    except Exception:
-        pass
-    sys.exit("日本語フォントが見つかりません。'sudo apt-get install fonts-noto-cjk' を実行してください")
+    out = subprocess.run(["fc-list", ":lang=ja", "file"], capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        f = line.split(":")[0].strip()
+        if f.endswith((".ttc", ".ttf", ".otf")):
+            return f
+    sys.exit("日本語フォントが見つかりません。'sudo apt-get install fonts-noto-cjk fonts-mplus' を実行してください")
 
 
-FONT_PATH = find_font()
+FONT_HEAVY = pick_font(FONT_HEAVY_CANDIDATES)
+FONT_BOLD = pick_font(FONT_BOLD_CANDIDATES)
+# ★☆はM PLUS未収録のためNotoで描く
+FONT_SYMBOL = pick_font(["/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+                         FONT_BOLD_CANDIDATES[-1]])
 
 
 def stars_text(v) -> str:
@@ -109,37 +150,96 @@ def stars_text(v) -> str:
         return ""
 
 
+# ============================================================
+# レンダラー(縦1920px基準で設計し、比例縮尺)
+# ============================================================
 class Renderer:
-    """縦1920px基準でデザインし、任意の縦横比に比例縮尺して描画する"""
-
-    def __init__(self, w: int, h: int, palette):
+    def __init__(self, w: int, h: int, season: dict):
         self.w, self.h = w, h
-        self.k = h / 1920  # 縦方向スケール(フォント・座標・図形に共通適用)
-        self.bg_top, self.bg_bottom = palette
+        self.k = h / 1920
+        self.s = season
 
-    # --- スケール補助 ---
-    def f(self, size: int) -> ImageFont.FreeTypeFont:
-        return ImageFont.truetype(FONT_PATH, max(int(size * self.k), 12))
+    # --- 基本ヘルパー ---
+    def f(self, size: int, heavy=True) -> ImageFont.FreeTypeFont:
+        return ImageFont.truetype(FONT_HEAVY if heavy else FONT_BOLD, max(int(size * self.k), 12))
 
     def y(self, v: float) -> int:
         return int(v * self.k)
 
-    # --- 描画補助 ---
+    def rank_color(self, i: int):
+        return [RANK_GOLD, RANK_SILVER, RANK_BRONZE][i] if i < 3 else self.s["accents"][0]
+
+    # --- 背景(グラデ+紙吹雪+季節の飾り) ---
     def bg(self) -> Image.Image:
         img = Image.new("RGB", (self.w, self.h))
+        top, bottom = self.s["bg_top"], self.s["bg_bottom"]
         for yy in range(self.h):
             t = yy / self.h
-            c = tuple(int(a + (b - a) * t) for a, b in zip(self.bg_top, self.bg_bottom))
+            c = tuple(int(a + (b - a) * t) for a, b in zip(top, bottom))
             img.paste(c, (0, yy, self.w, yy + 1))
+
+        ov = Image.new("RGBA", (self.w, self.h), (0, 0, 0, 0))
+        d = ImageDraw.Draw(ov)
+        rnd = random.Random(7)
+
+        # 紙吹雪(小さな丸・四角)
+        for _ in range(26):
+            x, yy = rnd.randint(0, self.w), rnd.randint(0, self.h)
+            r = self.y(rnd.randint(8, 18))
+            col = rnd.choice(self.s["accents"]) + (rnd.randint(50, 95),)
+            if rnd.random() < 0.5:
+                d.ellipse([x - r, yy - r, x + r, yy + r], fill=col)
+            else:
+                d.rounded_rectangle([x - r, yy - r, x + r, yy + r], radius=r // 3, fill=col)
+
+        # 季節の飾り
+        deco = self.s["deco"]
+        for _ in range(14):
+            x, yy = rnd.randint(0, self.w), rnd.randint(0, self.h)
+            r = self.y(rnd.randint(16, 30))
+            a = rnd.randint(60, 110)
+            if deco == "petal":      # 桜の花びら(傾いた楕円)
+                pink = (255, 150, 190, a)
+                d.ellipse([x - r, yy - r // 2, x + r, yy + r // 2], fill=pink)
+            elif deco == "bubble":   # 泡(輪っか)
+                aqua = (90, 200, 235, a)
+                d.ellipse([x - r, yy - r, x + r, yy + r], outline=aqua, width=max(self.y(5), 2))
+            elif deco == "leaf":     # 落ち葉(楕円+軸)
+                col = rnd.choice([(242, 140, 40), (201, 79, 46), (227, 181, 5)]) + (a,)
+                d.ellipse([x - r, yy - r // 2, x + r, yy + r // 2], fill=col)
+                d.line([x - r, yy, x + r, yy], fill=(120, 70, 30, a), width=max(self.y(3), 1))
+            else:                    # 雪の結晶(アスタリスク)
+                blue = (120, 170, 225, a)
+                wdt = max(self.y(5), 2)
+                for ang in (0, 60, 120):
+                    rad = math.radians(ang)
+                    dx, dy = r * math.cos(rad), r * math.sin(rad)
+                    d.line([x - dx, yy - dy, x + dx, yy + dy], fill=blue, width=wdt)
+
+        img = Image.alpha_composite(img.convert("RGBA"), ov).convert("RGB")
         return img
 
-    def wrap(self, draw, text: str, fnt, max_width: int) -> list[str]:
+    # --- 白カード(影+アクセント枠) ---
+    def card(self, d: ImageDraw.ImageDraw, x1, y1, x2, y2, border):
+        off = self.y(10)
+        d.rounded_rectangle([x1 + off, y1 + off, x2 + off, y2 + off],
+                            radius=self.y(44), fill=self._shade())
+        d.rounded_rectangle([x1, y1, x2, y2], radius=self.y(44),
+                            fill=WHITE, outline=border, width=max(self.y(7), 3))
+
+    def _shade(self):
+        ink = self.s["ink"]
+        bgb = self.s["bg_bottom"]
+        return tuple((a * 35 + b * 65) // 100 for a, b in zip(ink, bgb))
+
+    # --- テキスト ---
+    def wrap(self, d, text, fnt, max_w):
         lines, cur = [], ""
         for ch in text:
             if ch == "\n":
                 lines.append(cur); cur = ""
                 continue
-            if draw.textlength(cur + ch, font=fnt) > max_width:
+            if d.textlength(cur + ch, font=fnt) > max_w:
                 lines.append(cur); cur = ch
             else:
                 cur += ch
@@ -147,150 +247,189 @@ class Renderer:
             lines.append(cur)
         return lines
 
-    def center_wrapped(self, draw, yy: int, text: str, fnt, fill, side_margin: int, line_gap=14) -> int:
-        max_width = self.w - side_margin * 2
-        for line in self.wrap(draw, text, fnt, max_width):
-            lw = draw.textlength(line, font=fnt)
-            draw.text(((self.w - lw) // 2, yy), line, font=fnt, fill=fill)
-            yy += fnt.size + self.y(line_gap)
+    def center_wrapped(self, d, yy, text, fnt, fill, max_w, gap=14):
+        for line in self.wrap(d, text, fnt, max_w):
+            d.text(((self.w - d.textlength(line, font=fnt)) // 2, yy), line, font=fnt, fill=fill)
+            yy += fnt.size + self.y(gap)
         return yy
 
-    def center_line(self, draw, yy: int, text: str, fnt, fill) -> int:
-        draw.text(((self.w - draw.textlength(text, font=fnt)) // 2, yy), text, font=fnt, fill=fill)
+    def center_line(self, d, yy, text, fnt, fill):
+        d.text(((self.w - d.textlength(text, font=fnt)) // 2, yy), text, font=fnt, fill=fill)
         return yy + fnt.size
 
-    def footer(self, draw):
+    def pill(self, d, cy, text, fnt, bg, fg):
+        tw = d.textlength(text, font=fnt)
+        pw, ph = tw + self.y(70), fnt.size + self.y(34)
+        x1 = (self.w - pw) // 2
+        d.rounded_rectangle([x1, cy, x1 + pw, cy + ph], radius=ph // 2, fill=bg)
+        d.text(((self.w - tw) // 2, cy + self.y(15)), text, font=fnt, fill=fg)
+        return cy + ph
+
+    def star_line(self, d, yy, label, v, fill):
+        """「話題性 ★★★★☆」をラベル=M PLUS、星=Notoの混植で中央描画"""
+        f1 = self.f(50)
+        f2 = ImageFont.truetype(FONT_SYMBOL, max(int(50 * self.k), 12))
+        seg1, seg2 = f"{label} ", stars_text(v)
+        w1, w2 = d.textlength(seg1, font=f1), d.textlength(seg2, font=f2)
+        x = (self.w - (w1 + w2)) // 2
+        d.text((x, yy), seg1, font=f1, fill=fill)
+        d.text((x + w1, yy + self.y(3)), seg2, font=f2, fill=fill)
+        return yy + f1.size
+
+    def footer(self, d):
         fnt = self.f(34)
-        draw.text(((self.w - draw.textlength(BRAND, font=fnt)) // 2, self.h - self.y(110)),
-                  BRAND, font=fnt, fill=GRAY)
+        # TikTok/リールの下部UIに被らないよう高めに配置(セーフゾーン)
+        d.text(((self.w - d.textlength(BRAND, font=fnt)) // 2, self.h - self.y(190)),
+               BRAND, font=fnt, fill=self.s["muted"])
 
     # --- スライド ---
     def cover(self, date_s: str, n: int, label: str) -> Image.Image:
         img = self.bg()
         d = ImageDraw.Draw(img)
-        d.rectangle([self.w // 2 - self.y(60), self.y(280),
-                     self.w // 2 + self.y(60), self.y(288)], fill=RANK_COLORS[0])
-        yy = self.y(400)
-        yy = self.center_line(d, yy, "今週の", self.f(80), WHITE) + self.y(40)
-        yy = self.center_line(d, yy, label, self.f(110), WHITE) + self.y(50)
-        yy = self.center_line(d, yy, f"TOP{n}", self.f(150), RANK_COLORS[0]) + self.y(85)
-        yy = self.center_line(d, yy, date_s, self.f(56), WHITE) + self.y(120)
-        self.center_wrapped(d, yy, TAGLINE, self.f(38), GRAY, side_margin=100)
+        acc = self.s["accents"]
+
+        yy = self.y(310)
+        yy = self.center_line(d, yy, BRAND, self.f(40), self.s["muted"]) + self.y(60)
+        # 季節バッジ
+        yy = self.pill(d, yy, f"{self.s['en']}・{self.s['ja']}のランキング",
+                       self.f(44), acc[1], WHITE) + self.y(65)
+
+        self.card(d, self.y(70), yy, self.w - self.y(70), yy + self.y(760), acc[0])
+        cy = yy + self.y(95)
+        cy = self.center_line(d, cy, "今週の", self.f(84), self.s["ink"]) + self.y(35)
+        cy = self.center_line(d, cy, label, self.f(120), acc[0]) + self.y(50)
+        cy = self.center_line(d, cy, f"TOP{n}", self.f(170), RANK_GOLD) + self.y(70)
+        self.center_line(d, cy, date_s, self.f(54), self.s["muted"])
+
+        self.center_wrapped(d, yy + self.y(850), TAGLINE, self.f(38, heavy=False),
+                            self.s["ink"], self.w - self.y(220))
         self.footer(d)
         return img
 
     def cm_slide(self, rank: int, c: dict) -> Image.Image:
         img = self.bg()
         d = ImageDraw.Draw(img)
-        accent = rank_color(rank)
+        accent = self.rank_color(rank)
 
-        # 順位バッジ
-        cx, cy, r = self.w // 2, self.y(310), self.y(125)
-        d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=accent, width=max(self.y(10), 4))
-        fnt = self.f(76)
+        # 順位バッジ(塗りつぶし円+白文字)
+        cx, cy, r = self.w // 2, self.y(300), self.y(120)
+        d.ellipse([cx - r - self.y(12), cy - r - self.y(12),
+                   cx + r + self.y(12), cy + r + self.y(12)], fill=WHITE)
+        d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=accent)
+        fnt = self.f(72)
         label = rank_label(rank)
-        d.text((cx - d.textlength(label, font=fnt) // 2, cy - self.y(52)),
-               label, font=fnt, fill=accent)
+        d.text((cx - d.textlength(label, font=fnt) // 2, cy - self.y(48)),
+               label, font=fnt, fill=WHITE)
 
-        # 企業名・商品名
-        yy = self.y(530)
-        yy = self.center_wrapped(d, yy, c.get("company", ""), self.f(84), WHITE, side_margin=80)
+        # コンテンツカード
+        top = self.y(480)
+        self.card(d, self.y(70), top, self.w - self.y(70), self.h - self.y(370), accent)
+        yy = top + self.y(70)
+        yy = self.center_wrapped(d, yy, c.get("company", ""), self.f(78),
+                                 self.s["ink"], self.w - self.y(260))
         if c.get("product"):
-            yy = self.center_wrapped(d, yy + self.y(8), f"「{c['product']}」",
-                                     self.f(62), accent, side_margin=80)
+            yy = self.center_wrapped(d, yy + self.y(6), f"「{c['product']}」",
+                                     self.f(56), accent, self.w - self.y(260))
 
-        # 区切り線
-        yy += self.y(38)
-        d.rectangle([self.y(180), yy, self.w - self.y(180), yy + max(self.y(4), 2)],
-                    fill=(80, 84, 110))
-        yy += self.y(56)
+        # ドット区切り
+        yy += self.y(42)
+        for i in range(5):
+            dx = self.w // 2 + self.y((i - 2) * 56)
+            d.ellipse([dx - self.y(9), yy, dx + self.y(9), yy + self.y(18)],
+                      fill=self.s["accents"][i % 4])
+        yy += self.y(70)
 
-        # 一言分析
-        yy = self.center_wrapped(d, yy, c.get("hitokoto", ""), self.f(58), WHITE,
-                                 side_margin=110, line_gap=22)
-
-        # キーワード
+        yy = self.center_wrapped(d, yy, c.get("hitokoto", ""), self.f(54, heavy=False),
+                                 self.s["ink"], self.w - self.y(300), gap=20)
         kw = c.get("keywords") or []
         if kw:
             yy += self.y(26)
-            kw_s = "  ".join(f"#{k}" for k in kw[:4])
-            yy = self.center_wrapped(d, yy, kw_s, self.f(44), GRAY, side_margin=100)
-
-        # 話題性スター + 公開日
+            yy = self.center_wrapped(d, yy, "  ".join(f"#{k}" for k in kw[:4]),
+                                     self.f(42), self.s["accents"][3], self.w - self.y(280))
         r_ = (c.get("ratings") or {}).get("話題性")
-        yy += self.y(44)
+        yy += self.y(40)
         if stars_text(r_):
-            yy = self.center_line(d, yy, f"話題性 {stars_text(r_)}", self.f(52), accent) + self.y(36)
-        self.center_line(d, yy, f"{c.get('published_at', '')} 公開", self.f(40), GRAY)
-
+            yy = self.star_line(d, yy, "話題性", r_, RANK_GOLD) + self.y(34)
+        self.center_line(d, yy, f"{c.get('published_at', '')} 公開", self.f(38, heavy=False),
+                         self.s["muted"])
         self.footer(d)
         return img
 
     def list_slide(self, rest: list[dict], total: int) -> Image.Image:
-        """4位〜N位の一覧スライド"""
         img = self.bg()
         d = ImageDraw.Draw(img)
-        yy = self.y(200)
-        yy = self.center_line(d, yy, f"4位〜{total}位", self.f(84), OTHER_COLOR) + self.y(50)
-        d.rectangle([self.y(180), yy, self.w - self.y(180), yy + max(self.y(4), 2)],
-                    fill=(80, 84, 110))
-        yy += self.y(70)
+        acc = self.s["accents"]
 
-        num_fnt = self.f(52)
-        name_fnt = self.f(50)
-        row_gap = self.y(150)
+        yy = self.y(200)
+        yy = self.pill(d, yy, f"4位 〜 {total}位", self.f(64), acc[0], WHITE) + self.y(70)
+        self.card(d, self.y(70), yy, self.w - self.y(70), self.h - self.y(340), acc[1])
+
+        row_y = yy + self.y(75)
+        num_f, name_f = self.f(46), self.f(46)
         left = self.y(150)
         for i, c in enumerate(rest, start=4):
+            col = acc[(i - 4) % 4]
+            # 番号サークル
+            cr = self.y(42)
+            ccx = left + cr
+            ccy = row_y + self.y(30)
+            d.ellipse([ccx - cr, ccy - cr, ccx + cr, ccy + cr], fill=col)
+            num_s = str(i)
+            d.text((ccx - d.textlength(num_s, font=num_f) // 2, ccy - self.y(32)),
+                   num_s, font=num_f, fill=WHITE)
+            # 名前(1行省略)
             prod = f"「{c['product']}」" if c.get("product") else ""
             text = f"{c.get('company', '')}{prod}"
-            # 1行に収まるよう末尾を省略
-            max_w = self.w - left - self.y(210)
-            while text and d.textlength(text, font=name_fnt) > max_w:
+            full = text
+            max_w = self.w - left - self.y(260)
+            while text and d.textlength(text, font=name_f) > max_w:
                 text = text[:-1]
-            if text != f"{c.get('company', '')}{prod}":
+            if text != full:
                 text = text[:-1] + "…"
-            d.text((left, yy), f"{i}位", font=num_fnt, fill=OTHER_COLOR)
-            d.text((left + self.y(170), yy), text, font=name_fnt, fill=WHITE)
-            yy += row_gap
+            d.text((left + self.y(115), row_y), text, font=name_f, fill=self.s["ink"])
+            row_y += self.y(142)
         self.footer(d)
         return img
 
     def outro(self) -> Image.Image:
         img = self.bg()
         d = ImageDraw.Draw(img)
-        yy = self.y(660)
-        yy = self.center_line(d, yy, "各CMのリンクは", self.f(72), WHITE) + self.y(50)
-        yy = self.center_line(d, yy, "投稿本文からチェック", self.f(72), WHITE) + self.y(110)
-        self.center_line(d, yy, "毎週更新", self.f(64), RANK_COLORS[0])
+        acc = self.s["accents"]
+        top = self.y(600)
+        self.card(d, self.y(90), top, self.w - self.y(90), top + self.y(560), acc[0])
+        yy = top + self.y(110)
+        yy = self.center_line(d, yy, "リンクはすべて", self.f(66), self.s["ink"]) + self.y(42)
+        yy = self.center_line(d, yy, "投稿本文からチェック", self.f(66), self.s["ink"]) + self.y(90)
+        self.pill(d, yy, "フォローして最新回をチェック", self.f(46), acc[2], WHITE)
         self.footer(d)
         return img
 
 
-def build_video(slides, out_path: Path, w: int, h: int):
+# ============================================================
+# 動画化
+# ============================================================
+def build_video(slides, out_path: Path):
     with tempfile.TemporaryDirectory() as td:
         tdir = Path(td)
         clips = []
         for i, img in enumerate(slides):
-            png = tdir / f"slide_{i}.png"
+            png = tdir / f"s{i}.png"
             img.save(png)
-            clip = tdir / f"clip_{i}.mp4"
+            clip = tdir / f"c{i}.mp4"
             subprocess.run([
                 "ffmpeg", "-y", "-loglevel", "error",
                 "-loop", "1", "-t", str(SLIDE_SEC), "-i", str(png),
                 "-vf", (f"fade=t=in:st=0:d={FADE},"
-                        f"fade=t=out:st={SLIDE_SEC - FADE}:d={FADE},"
-                        f"format=yuv420p"),
+                        f"fade=t=out:st={SLIDE_SEC - FADE}:d={FADE},format=yuv420p"),
                 "-r", str(FPS), "-c:v", "libx264", "-preset", "medium", "-crf", "26",
                 str(clip),
             ], check=True)
             clips.append(clip)
         lst = tdir / "list.txt"
         lst.write_text("".join(f"file '{c}'\n" for c in clips), encoding="utf-8")
-        subprocess.run([
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-f", "concat", "-safe", "0", "-i", str(lst),
-            "-c", "copy", str(out_path),
-        ], check=True)
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error",
+                        "-f", "concat", "-safe", "0", "-i", str(lst),
+                        "-c", "copy", str(out_path)], check=True)
 
 
 def main():
@@ -298,9 +437,9 @@ def main():
     day_dir = OUT_ROOT / date_s
 
     month = int(date_s.split("-")[1])
-    season = SEASON_OVERRIDE or season_of(month)
-    palette = SEASON_PALETTES[season]
-    print(f"[info] 背景パレット: {season}")
+    season_key = SEASON_OVERRIDE or season_of(month)
+    season = SEASONS[season_key]
+    print(f"[info] 季節テーマ: {season_key}({season['ja']})")
     disp_date = date_s.replace("-", "/")
 
     made = 0
@@ -314,8 +453,9 @@ def main():
             print(f"[warn] {label} のランキングが空のためスキップ")
             continue
         n = len(top)
+        outputs = {}
         for size_name, (w, h) in SIZES.items():
-            r = Renderer(w, h, palette)
+            r = Renderer(w, h, season)
             slides = [r.cover(disp_date, n, label)]
             slides += [r.cm_slide(i, top[i]) for i in (0, 1, 2) if i < n]
             if n > 3:
@@ -323,13 +463,20 @@ def main():
             slides.append(r.outro())
             fname = f"{size_name}.mp4" if key == "all" else f"{key}_{size_name}.mp4"
             out_path = day_dir / fname
-            build_video(slides, out_path, w, h)
-            size_mb = out_path.stat().st_size / 1024 / 1024
-            print(f"[info] 動画生成完了: {out_path} ({w}x{h} / {size_mb:.1f}MB / "
-                  f"約{SLIDE_SEC * len(slides):.0f}秒)")
+            build_video(slides, out_path)
+            outputs[size_name] = out_path
+            print(f"[info] 動画生成完了: {out_path} ({w}x{h} / "
+                  f"{out_path.stat().st_size / 1048576:.1f}MB / 約{SLIDE_SEC * len(slides):.0f}秒)")
+            made += 1
+        # TikTok用(9:16の複製)
+        if TIKTOK_FROM in outputs:
+            tk = outputs[TIKTOK_FROM].with_name(
+                "tiktok.mp4" if key == "all" else f"{key}_tiktok.mp4")
+            shutil.copyfile(outputs[TIKTOK_FROM], tk)
+            print(f"[info] 動画生成完了: {tk} (TikTok用 / {TIKTOK_FROM}と同内容)")
             made += 1
     if made == 0:
-        sys.exit("生成できた動画がありません。先に idol_trend_watch.py を実行してください")
+        sys.exit("生成できた動画がありません。先に収集スクリプトを実行してください")
 
 
 if __name__ == "__main__":
