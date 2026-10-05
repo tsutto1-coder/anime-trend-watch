@@ -31,7 +31,7 @@ OUT_ROOT = BASE_DIR / "outputs"
 JST = timezone(timedelta(hours=9))
 
 ROOT_FOLDER_NAME = "ANIME TREND WATCH"
-UPLOAD_FILES = ["reel.mp4", "feed.mp4", "digest.txt", "x.txt",
+UPLOAD_FILES = ["reel.mp4", "feed.mp4", "tiktok.mp4", "digest.txt", "x.txt",
                 "threads.txt", "instagram.txt", "note.md"]
 
 TOKEN_URL = "https://oauth2.googleapis.com/token"
